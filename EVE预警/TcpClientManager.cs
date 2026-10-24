@@ -1,6 +1,7 @@
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using EVE预警.Intel;
 
 namespace EVE预警
 {
@@ -19,6 +20,7 @@ namespace EVE预警
         private string _galaxy = "";
         private CancellationTokenSource? _receiveCts;
         private System.Threading.Timer? _heartbeatTimer;
+        private readonly SemaphoreSlim _sendLock = new(1, 1);
 
         // 预警去重
         private Dictionary<ImageProcessor.AlertType, int> _lastSentAlerts = new();
@@ -33,6 +35,7 @@ namespace EVE预警
         public event EventHandler<string>? MessageReceived;
         public event EventHandler<bool>? ConnectionStateChanged;
         public event EventHandler<string>? ErrorOccurred;
+        public event EventHandler<IntelAlertPayload>? IntelAlertReceived;
 
         /// <summary>
         /// 是否已连接
@@ -98,10 +101,7 @@ namespace EVE预警
                     // 发送断开通知（可选）
                     if (_networkStream?.CanWrite == true)
                     {
-                        var message = new { type = "disconnect" };
-                        string json = JsonSerializer.Serialize(message) + "\n";
-                        var bytes = Encoding.UTF8.GetBytes(json);
-                        await _networkStream.WriteAsync(bytes);
+                        await WriteMessageAsync(JsonSerializer.Serialize(new { type = "disconnect" }) + "\n");
                     }
                 }
                 catch { }
@@ -152,10 +152,7 @@ namespace EVE预警
                 };
 
                 string json = JsonSerializer.Serialize(messageObj) + "\n";
-                var bytes = Encoding.UTF8.GetBytes(json);
-
-                await _networkStream.WriteAsync(bytes);
-                await _networkStream.FlushAsync();
+                await WriteMessageAsync(json);
 
                 // 更新上次发送的预警
                 lock (_alertsLock)
@@ -174,6 +171,63 @@ namespace EVE预警
         }
 
         /// <summary>
+        /// 发送预警频道消息（由服务器广播给其他客户端，发送者本地已经响过）
+        /// </summary>
+        public async Task<bool> SendIntelAlertAsync(IntelAlert alert)
+        {
+            if (!_isConnected || _networkStream == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var messageObj = new
+                {
+                    type = "intel",
+                    galaxy = alert.SystemName,
+                    system = alert.SystemName,
+                    jumps = alert.Jumps,
+                    channel = alert.ChannelName,
+                    author = alert.Author,
+                    message = alert.Text,
+                    time = alert.TimestampUtc.ToString("O"),
+                };
+
+                await WriteMessageAsync(JsonSerializer.Serialize(messageObj) + "\n");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ErrorOccurred?.Invoke(this, $"发送频道预警失败: {ex.Message}");
+                HandleDisconnect();
+                return false;
+            }
+        }
+
+        /// <summary>串行化所有写入，避免心跳与预警同时写导致 JSON 交错。</summary>
+        private async Task WriteMessageAsync(string json)
+        {
+            NetworkStream? stream = _networkStream;
+            if (stream == null)
+            {
+                return;
+            }
+
+            byte[] bytes = Encoding.UTF8.GetBytes(json);
+            await _sendLock.WaitAsync();
+            try
+            {
+                await stream.WriteAsync(bytes);
+                await stream.FlushAsync();
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        /// <summary>
         /// 发送心跳
         /// </summary>
         private async Task SendHeartbeatAsync()
@@ -184,10 +238,7 @@ namespace EVE预警
             {
                 var message = new { type = "heartbeat" };
                 string json = JsonSerializer.Serialize(message) + "\n";
-                var bytes = Encoding.UTF8.GetBytes(json);
-
-                await _networkStream.WriteAsync(bytes);
-                await _networkStream.FlushAsync();
+                await WriteMessageAsync(json);
             }
             catch
             {
@@ -210,10 +261,7 @@ namespace EVE预警
             };
 
             string json = JsonSerializer.Serialize(messageObj) + "\n";
-            var bytes = Encoding.UTF8.GetBytes(json);
-
-            await _networkStream.WriteAsync(bytes);
-            await _networkStream.FlushAsync();
+            await WriteMessageAsync(json);
         }
 
         /// <summary>
@@ -279,8 +327,43 @@ namespace EVE预警
         {
             try
             {
+                json = json.TrimStart('﻿');
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
+
+                // 服务器产出的预警频道消息（带 type=intel）
+                if (root.TryGetProperty("type", out var typeProp) &&
+                    string.Equals(typeProp.GetString(), "intel", StringComparison.OrdinalIgnoreCase))
+                {
+                    string system = GetString(root, "system") ?? GetString(root, "galaxy") ?? "未知";
+                    int jumps = root.TryGetProperty("jumps", out var jumpsProp) &&
+                                jumpsProp.TryGetInt32(out int parsedJumps)
+                        ? parsedJumps
+                        : -1;
+
+                    DateTime timestamp = DateTime.UtcNow;
+                    string? timeText = GetString(root, "time");
+                    if (!string.IsNullOrWhiteSpace(timeText) &&
+                        DateTime.TryParse(
+                            timeText,
+                            null,
+                            System.Globalization.DateTimeStyles.AdjustToUniversal |
+                            System.Globalization.DateTimeStyles.AssumeUniversal,
+                            out DateTime parsedTime))
+                    {
+                        timestamp = parsedTime;
+                    }
+
+                    IntelAlertReceived?.Invoke(this, new IntelAlertPayload(
+                        Galaxy: GetString(root, "galaxy") ?? system,
+                        System: system,
+                        Jumps: jumps,
+                        Channel: GetString(root, "channel") ?? "",
+                        Author: GetString(root, "author") ?? "",
+                        Text: GetString(root, "message") ?? "",
+                        TimestampUtc: timestamp));
+                    return;
+                }
 
                 if (root.TryGetProperty("galaxy", out var galaxyProp) &&
                     root.TryGetProperty("message", out var messageProp))
@@ -296,6 +379,12 @@ namespace EVE预警
                 ErrorOccurred?.Invoke(this, $"解析消息失败: {ex.Message}");
             }
         }
+
+        private static string? GetString(JsonElement root, string propertyName) =>
+            root.TryGetProperty(propertyName, out JsonElement value) &&
+            value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
 
         /// <summary>
         /// 心跳回调

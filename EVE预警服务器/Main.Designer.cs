@@ -142,9 +142,9 @@
             labelStatus.Size = new Size(94, 20);
             labelStatus.TabIndex = 5;
             labelStatus.Text = "状态: 未启动";
-            // 
+            //
             // Main
-            // 
+            //
             AutoScaleDimensions = new SizeF(9F, 20F);
             AutoScaleMode = AutoScaleMode.Font;
             ClientSize = new Size(900, 580);

@@ -50,6 +50,8 @@
             richTextBoxAlertLog = new RichTextBox();
             labelAlertLog = new Label();
             labelConnectionState = new Label();
+            buttonIntelSettings = new Button();
+            buttonStopAlert = new Button();
             ((System.ComponentModel.ISupportInitialize)pictureBox).BeginInit();
             ((System.ComponentModel.ISupportInitialize)trackBarStartX).BeginInit();
             ((System.ComponentModel.ISupportInitialize)trackBarStartY).BeginInit();
@@ -289,6 +291,7 @@
             checkBoxPlaySound.TabIndex = 24;
             checkBoxPlaySound.Text = "报警时播放声音";
             checkBoxPlaySound.UseVisualStyleBackColor = true;
+            checkBoxPlaySound.Checked = true;
             // 
             // buttonCropSelect
             // 
@@ -365,12 +368,34 @@
             labelConnectionState.Size = new Size(68, 20);
             labelConnectionState.TabIndex = 32;
             labelConnectionState.Text = "● 未连接";
-            // 
+            //
+            // buttonIntelSettings
+            //
+            buttonIntelSettings.Location = new Point(13, 745);
+            buttonIntelSettings.Name = "buttonIntelSettings";
+            buttonIntelSettings.Size = new Size(296, 29);
+            buttonIntelSettings.TabIndex = 33;
+            buttonIntelSettings.Text = "预警与音频设置";
+            buttonIntelSettings.UseVisualStyleBackColor = true;
+            buttonIntelSettings.Click += buttonIntelSettings_Click;
+            //
+            // buttonStopAlert
+            //
+            buttonStopAlert.Location = new Point(321, 745);
+            buttonStopAlert.Name = "buttonStopAlert";
+            buttonStopAlert.Size = new Size(150, 29);
+            buttonStopAlert.TabIndex = 34;
+            buttonStopAlert.Text = "停止警报";
+            buttonStopAlert.UseVisualStyleBackColor = true;
+            buttonStopAlert.Click += buttonStopAlert_Click;
+            //
             // Main
-            // 
+            //
             AutoScaleDimensions = new SizeF(9F, 20F);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(800, 755);
+            ClientSize = new Size(800, 790);
+            Controls.Add(buttonStopAlert);
+            Controls.Add(buttonIntelSettings);
             Controls.Add(labelConnectionState);
             Controls.Add(buttonDisconnectServer);
             Controls.Add(labelServerIP);
@@ -450,5 +475,7 @@
         private RichTextBox richTextBoxAlertLog;
         private Label labelAlertLog;
         private Label labelConnectionState;
+        private Button buttonIntelSettings;
+        private Button buttonStopAlert;
     }
 }

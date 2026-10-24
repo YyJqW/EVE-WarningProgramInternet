@@ -12,6 +12,23 @@ namespace EVE预警
         public string LastConnectedUsername { get; set; } = "";
         public bool AutoReconnect { get; set; } = true;
 
+        // ---- 聊天日志预警频道 ----
+        public bool IntelAlertEnabled { get; set; } = false;
+        public string IntelLogDirectory { get; set; } = "";
+        public string IntelHomeSystem { get; set; } = "";
+        public int IntelJumpRange { get; set; } = 3;
+        public List<string> IntelChannels { get; set; } = new();
+        public string IntelSoundPath { get; set; } = "";
+        public int IntelCooldownSeconds { get; set; } = 60;
+
+        // ---- 音频 ----
+        // 本地色块预警（红/白等）与频道预警使用两套独立音频与音量
+        public string LocalAlertSoundPath { get; set; } = "";
+        public int LocalAlertVolume { get; set; } = 100;   // 0-100
+        public int IntelAlertVolume { get; set; } = 100;   // 0-100
+        public int AudioSettingsVersion { get; set; } = 0; // 0=旧配置，升级时迁移一次
+        public int AlertLoopSeconds { get; set; } = 30;    // 0=只播放一次
+
         private static string GetConfigPath()
         {
             string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);

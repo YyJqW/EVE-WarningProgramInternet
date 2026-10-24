@@ -17,10 +17,26 @@ namespace EVE预警服务器
         private readonly Dictionary<string, ClientInfo> _clients = new();
         private readonly object _clientsLock = new object();
 
+        // 服务器配置（仅端口持久化）
+        private ServerConfig _config = new();
+
         public Main()
         {
             InitializeComponent();
             InitializeListView();
+            _config = ServerConfig.Load();
+            textBoxPort.Text = _config.Port.ToString();
+
+            // VM/无人值守场景：带 --autostart 启动时自动开始监听
+            if (Environment.GetCommandLineArgs()
+                .Any(a => string.Equals(a, "--autostart", StringComparison.OrdinalIgnoreCase)))
+            {
+                Shown += (_, _) =>
+                {
+                    AddLog("[服务器] 检测到 --autostart，自动开始监听");
+                    buttonStart.PerformClick();
+                };
+            }
         }
 
         /// <summary>
@@ -35,19 +51,46 @@ namespace EVE预警服务器
         }
 
         /// <summary>
-        /// 添加日志
+        /// 添加日志（同时写入 %APPDATA%\EVE预警\server.log，便于 VM 无人值守时排查）
         /// </summary>
         private void AddLog(string message)
         {
+            string logEntry = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+            WriteLogFile(logEntry);
+
             if (InvokeRequired)
             {
-                Invoke(new Action(() => AddLog(message)));
+                Invoke(new Action(() => AppendLogLine(logEntry)));
                 return;
             }
 
-            string logEntry = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+            AppendLogLine(logEntry);
+        }
+
+        private void AppendLogLine(string logEntry)
+        {
             richTextBoxLog.AppendText(logEntry + Environment.NewLine);
             richTextBoxLog.ScrollToCaret();
+        }
+
+        private static readonly object LogFileLock = new();
+
+        private static void WriteLogFile(string line)
+        {
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "EVE预警");
+                Directory.CreateDirectory(dir);
+                lock (LogFileLock)
+                {
+                    File.AppendAllText(Path.Combine(dir, "server.log"), line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // 日志写入失败不影响主流程
+            }
         }
 
         /// <summary>
@@ -90,6 +133,8 @@ namespace EVE预警服务器
             try
             {
                 int port = int.TryParse(textBoxPort.Text, out var p) ? p : 2424;
+                _config.Port = port;
+                ServerConfig.Save(_config);
 
                 _listener = new TcpListener(IPAddress.Any, port);
                 _listener.Start();
@@ -280,6 +325,7 @@ namespace EVE预警服务器
         {
             try
             {
+                json = json.TrimStart('﻿');
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
 
@@ -299,6 +345,10 @@ namespace EVE预警服务器
 
                     case "alert":
                         HandleAlert(client, root);
+                        break;
+
+                    case "intel":
+                        HandleClientIntel(client, root);
                         break;
                 }
             }
@@ -367,6 +417,60 @@ namespace EVE预警服务器
 
             // 广播给所有其他客户端
             await BroadcastAsync(broadcastJson, client.Key);
+        }
+
+        /// <summary>
+        /// 转发客户端产出的预警频道消息给其他客户端（不回报给发送者，发送者本地已响过）。
+        /// </summary>
+        private async void HandleClientIntel(ClientInfo client, JsonElement root)
+        {
+            try
+            {
+                string system = GetString(root, "system") ?? GetString(root, "galaxy") ?? "未知";
+                int jumps = root.TryGetProperty("jumps", out var jumpsProp) &&
+                            jumpsProp.TryGetInt32(out int parsedJumps)
+                    ? parsedJumps
+                    : -1;
+                string channel = Limit(GetString(root, "channel"), 64);
+                string author = Limit(GetString(root, "author"), 64);
+                string text = Limit(GetString(root, "message"), 500);
+                string time = GetString(root, "time") ?? DateTime.UtcNow.ToString("O");
+
+                var payload = new
+                {
+                    type = "intel",
+                    galaxy = system,
+                    system,
+                    jumps,
+                    channel,
+                    author,
+                    message = text,
+                    time,
+                };
+
+                AddLog($"[预警频道] {client.Username}: {system} ({jumps}跳) | {channel}/{author}: {text}");
+                await BroadcastAsync(JsonSerializer.Serialize(payload) + "\n", client.Key);
+            }
+            catch (Exception ex)
+            {
+                AddLog($"[警告] 处理频道预警失败: {ex.Message}");
+            }
+        }
+
+        private static string? GetString(JsonElement root, string propertyName) =>
+            root.TryGetProperty(propertyName, out JsonElement value) &&
+            value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+
+        private static string Limit(string? value, int maxLength)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return "";
+            }
+
+            return value.Length <= maxLength ? value : value[..maxLength];
         }
 
         /// <summary>
@@ -439,11 +543,18 @@ namespace EVE预警服务器
             }
         }
 
+
         /// <summary>
         /// 窗体关闭事件
         /// </summary>
         private async void Main_FormClosing(object sender, FormClosingEventArgs e)
         {
+            if (int.TryParse(textBoxPort.Text, out int port))
+            {
+                _config.Port = port;
+            }
+
+            ServerConfig.Save(_config);
             await StopServerAsync();
         }
     }

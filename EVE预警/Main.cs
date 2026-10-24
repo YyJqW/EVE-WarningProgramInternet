@@ -1,5 +1,8 @@
 using System.Drawing;
 using System.Threading.Tasks;
+using EVE预警.Audio;
+using EVE预警.ChatLog;
+using EVE预警.Intel;
 
 namespace EVE预警
 {
@@ -23,6 +26,11 @@ namespace EVE预警
         private AppConfig _config; // 应用程序配置
         private Dictionary<ImageProcessor.AlertType, int> _lastAlerts = new(); // 上次预警状态
 
+        // 预警频道（聊天日志）相关
+        private IntelAlertEngine? _intelEngine;
+        private ChatLogWatcher? _intelWatcher;
+        private AlertSoundPlayer? _alertSoundPlayer;
+
         public Main()
         {
             InitializeComponent();
@@ -30,6 +38,8 @@ namespace EVE预警
             InitializeUpdateRate();
             InitializeOcr();
             InitializeNetwork();
+            InitializeIntelAlert();
+            FormClosing += Main_FormClosing;
             AddLog("=== 程序启动成功 ===");
             AddLog($"程序版本: {System.Reflection.Assembly.GetExecutingAssembly().GetName().Version}");
             AddLog("当前时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
@@ -47,6 +57,277 @@ namespace EVE预警
             _tcpClientManager.MessageReceived += OnTcpMessageReceived;
             _tcpClientManager.ConnectionStateChanged += OnConnectionStateChanged;
             _tcpClientManager.ErrorOccurred += OnTcpError;
+            _tcpClientManager.IntelAlertReceived += OnIntelAlertReceived;
+        }
+
+        /// <summary>
+        /// 初始化聊天日志预警：加载离线星系数据并应用已保存的设置。
+        /// </summary>
+        private void InitializeIntelAlert()
+        {
+            // 兼容手工编辑过、字段为 null 的旧配置
+            _config.IntelChannels ??= new List<string>();
+            _config.IntelLogDirectory ??= "";
+            _config.IntelHomeSystem ??= "";
+            _config.IntelSoundPath ??= "";
+            _config.LocalAlertSoundPath ??= "";
+
+            // 兼容旧配置：以前本地色块与频道预警共用 IntelSoundPath（只迁移一次）
+            if (_config.AudioSettingsVersion < 1)
+            {
+                if (string.IsNullOrWhiteSpace(_config.LocalAlertSoundPath))
+                {
+                    _config.LocalAlertSoundPath = _config.IntelSoundPath;
+                }
+
+                _config.AudioSettingsVersion = 1;
+            }
+
+            _config.LocalAlertVolume = Math.Clamp(_config.LocalAlertVolume, 0, 100);
+            _config.IntelAlertVolume = Math.Clamp(_config.IntelAlertVolume, 0, 100);
+            _config.AlertLoopSeconds = Math.Clamp(_config.AlertLoopSeconds, 0, 600);
+
+            MapData.EnsureLoaded();
+            if (MapData.LoadError != null)
+            {
+                AddLog($"[预警频道] {MapData.LoadError}");
+            }
+
+            _alertSoundPlayer = new AlertSoundPlayer();
+            _intelEngine = new IntelAlertEngine();
+            _intelEngine.AlertRaised += OnIntelAlertRaised;
+
+            if (string.IsNullOrWhiteSpace(textBoxGalaxy.Text) &&
+                !string.IsNullOrWhiteSpace(_config.IntelHomeSystem))
+            {
+                textBoxGalaxy.Text = _config.IntelHomeSystem;
+            }
+
+            ApplyIntelSettings();
+        }
+
+        /// <summary>
+        /// 按 _config 应用预警频道设置。restartWatcher=false 时只更新判定逻辑。
+        /// </summary>
+        private bool ApplyIntelSettings(bool restartWatcher = true)
+        {
+            if (_intelEngine == null)
+            {
+                return false;
+            }
+
+            void Disable(string reason)
+            {
+                _intelEngine.Configure(new IntelAlertSettings());
+                AddLog($"[预警频道] {reason}");
+            }
+
+            if (restartWatcher)
+            {
+                _intelWatcher?.Dispose();
+                _intelWatcher = null;
+            }
+
+            if (!_config.IntelAlertEnabled)
+            {
+                Disable("未启用");
+                return false;
+            }
+
+            string? directory = ChatLogLocator.FindExisting(_config.IntelLogDirectory);
+            if (directory == null)
+            {
+                Disable("未找到聊天日志目录（Documents\\EVE\\logs\\Chatlogs），请到设置中手动选择");
+                return false;
+            }
+
+            _config.IntelLogDirectory = directory;
+
+            string homeSystem = textBoxGalaxy.Text.Trim();
+            int? homeSystemId = MapData.ResolveSystem(homeSystem);
+            if (homeSystemId == null)
+            {
+                Disable($"所在星系「{homeSystem}」无法识别，请使用设置窗口中的自动补全名称");
+                return false;
+            }
+
+            _config.IntelHomeSystem = homeSystem;
+
+            var channels = new HashSet<string>(
+                _config.IntelChannels.Where(c => !string.IsNullOrWhiteSpace(c)),
+                StringComparer.OrdinalIgnoreCase);
+            if (channels.Count == 0)
+            {
+                Disable("未勾选任何监控频道");
+                return false;
+            }
+
+            _intelEngine.Configure(new IntelAlertSettings
+            {
+                Enabled = true,
+                HomeSystemId = homeSystemId.Value,
+                MaxJumps = Math.Max(0, _config.IntelJumpRange),
+                Channels = channels,
+                CooldownSeconds = Math.Max(0, _config.IntelCooldownSeconds),
+            });
+
+            if (restartWatcher || _intelWatcher == null)
+            {
+                _intelWatcher = new ChatLogWatcher(directory);
+                _intelWatcher.MessageReceived += OnChatLogMessage;
+                _intelWatcher.ErrorOccurred += error => AddLog($"[预警频道] {error}");
+                _intelWatcher.Start(skipExisting: true);
+                if (!string.IsNullOrWhiteSpace(_intelWatcher.LastError))
+                {
+                    AddLog($"[预警频道] {_intelWatcher.LastError}");
+                }
+            }
+
+            AddLog(
+                $"[预警频道] 已启用: 所在星系 {MapData.GetDisplayName(homeSystemId.Value)}，" +
+                $"范围 {_config.IntelJumpRange} 跳，频道 {channels.Count} 个，目录 {directory}");
+            return true;
+        }
+
+        private void OnChatLogMessage(ChatLogMessage message)
+        {
+            _intelEngine?.OnMessage(message);
+        }
+
+        /// <summary>配置的警报循环时长；0 表示只播放一次。</summary>
+        private TimeSpan GetAlertLoopDuration() =>
+            TimeSpan.FromSeconds(Math.Max(0, _config.AlertLoopSeconds));
+
+        /// <summary>后台线程触发：写入预警日志、播放音频，并把消息转发给服务器广播。</summary>
+        private void OnIntelAlertRaised(IntelAlert alert)
+        {
+            // 生产者：本机已响过，转发给服务器后由服务器广播给其他客户端
+            if (_tcpClientManager?.IsConnected == true)
+            {
+                _ = _tcpClientManager.SendIntelAlertAsync(alert);
+            }
+
+            if (IsDisposed || Disposing || !IsHandleCreated)
+            {
+                return;
+            }
+
+            try
+            {
+                BeginInvoke((Action)(() =>
+                {
+                    string entry =
+                        $"[{alert.TimestampUtc.ToLocalTime():HH:mm:ss}] [预警频道] " +
+                        $"{alert.SystemName} ({alert.Jumps}跳) | {alert.ChannelName}/{alert.Author}: {alert.Text}";
+                    richTextBoxAlertLog.AppendText(entry + Environment.NewLine);
+                    richTextBoxAlertLog.ScrollToCaret();
+                    _alertSoundPlayer?.Play(
+                        _config.IntelSoundPath,
+                        _config.IntelAlertVolume / 100f,
+                        GetAlertLoopDuration());
+                }));
+            }
+            catch (InvalidOperationException)
+            {
+                // 窗口正在关闭或已释放
+            }
+        }
+
+        private void buttonStopAlert_Click(object? sender, EventArgs e)
+        {
+            _alertSoundPlayer?.Stop();
+            AddLog("[警报] 已手动停止播放");
+        }
+
+        private void buttonIntelSettings_Click(object? sender, EventArgs e)
+        {
+            using var form = new IntelAlertSettingsForm(
+                _config.IntelAlertEnabled,
+                _config.IntelLogDirectory,
+                textBoxGalaxy.Text.Trim(),
+                _config.IntelJumpRange,
+                _config.IntelChannels,
+                _config.LocalAlertSoundPath,
+                _config.LocalAlertVolume,
+                _config.IntelSoundPath,
+                _config.IntelAlertVolume,
+                _config.AlertLoopSeconds,
+                _config.IntelCooldownSeconds);
+
+            form.SimulateRequested += OnIntelSimulationRequested;
+
+            if (form.ShowDialog(this) != DialogResult.OK || form.Result == null)
+            {
+                return;
+            }
+
+            IntelAlertSettingsResult result = form.Result;
+            _config.IntelAlertEnabled = result.Enabled;
+            _config.IntelLogDirectory = result.LogDirectory;
+            _config.IntelHomeSystem = result.HomeSystem;
+            _config.IntelJumpRange = result.JumpRange;
+            _config.IntelChannels = result.Channels;
+            _config.IntelSoundPath = result.IntelSoundPath;
+            _config.IntelAlertVolume = result.IntelVolume;
+            _config.LocalAlertSoundPath = result.LocalSoundPath;
+            _config.LocalAlertVolume = result.LocalVolume;
+            _config.AlertLoopSeconds = result.LoopSeconds;
+            _config.IntelCooldownSeconds = result.CooldownSeconds;
+            textBoxGalaxy.Text = result.HomeSystem;
+
+            AppConfig.Save(_config);
+            ApplyIntelSettings(restartWatcher: true);
+        }
+
+        /// <summary>
+        /// 设置窗口「模拟一条预警消息」：用未保存的参数临时跑一遍完整链路，
+        /// 结束后恢复已保存设置。
+        /// </summary>
+        private void OnIntelSimulationRequested(IntelSimulationRequest request)
+        {
+            if (_intelEngine == null)
+            {
+                return;
+            }
+
+            int? homeSystemId = MapData.ResolveSystem(request.HomeSystem);
+            if (homeSystemId == null)
+            {
+                AddLog($"[预警频道] 模拟失败：无法识别星系「{request.HomeSystem}」");
+                return;
+            }
+
+            _intelEngine.Configure(new IntelAlertSettings
+            {
+                Enabled = true,
+                HomeSystemId = homeSystemId.Value,
+                MaxJumps = request.JumpRange,
+                Channels = request.Channels,
+                CooldownSeconds = 0,
+            });
+
+            string channel = request.Channels.FirstOrDefault() ?? "TestIntel";
+            _intelEngine.OnMessage(new ChatLogMessage(
+                ChannelName: channel,
+                TimestampUtc: DateTime.UtcNow,
+                Author: "测试角色",
+                Text: $"预警：{request.HomeSystem} 出现敌对",
+                FilePath: ""));
+
+            ApplyIntelSettings(restartWatcher: true);
+        }
+
+        private void Main_FormClosing(object? sender, FormClosingEventArgs e)
+        {
+            _intelWatcher?.Dispose();
+            _intelWatcher = null;
+            _alertSoundPlayer?.Dispose();
+            _alertSoundPlayer = null;
+
+            if (_config != null)
+            {
+                AppConfig.Save(_config);
+            }
         }
 
         private void InitializeOcr()
@@ -292,10 +573,20 @@ namespace EVE预警
                                                 }
                                             }
                                             
-                                            // 如果勾选了播放声音，则播放警报声音
+                                            // 本地色块预警：优先使用设置里的自定义音频
                                             if (checkBoxPlaySound.Checked)
                                             {
-                                                PlayAlertSound();
+                                                if (_alertSoundPlayer != null)
+                                                {
+                                                    _alertSoundPlayer.Play(
+                                                        _config.LocalAlertSoundPath,
+                                                        _config.LocalAlertVolume / 100f,
+                                                        GetAlertLoopDuration());
+                                                }
+                                                else
+                                                {
+                                                    PlayAlertSound();
+                                                }
                                             }
 
                                             // 发送预警数据到服务器（如果已连接）
@@ -594,6 +885,35 @@ namespace EVE预警
             string logEntry = $"[{DateTime.Now:HH:mm:ss.fff}] [广播] {displayMessage}";
             richTextBoxAlertLog.AppendText(logEntry + Environment.NewLine);
             richTextBoxAlertLog.ScrollToCaret();
+
+            // 消费端：收到其他玩家的色块预警广播
+            _alertSoundPlayer?.Play(
+                _config.LocalAlertSoundPath,
+                _config.LocalAlertVolume / 100f,
+                GetAlertLoopDuration());
+        }
+
+        /// <summary>
+        /// 收到服务器产出的预警频道消息（type=intel）。
+        /// </summary>
+        private void OnIntelAlertReceived(object? sender, IntelAlertPayload payload)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<object?, IntelAlertPayload>(OnIntelAlertReceived), sender, payload);
+                return;
+            }
+
+            string entry =
+                $"[{payload.TimestampUtc.ToLocalTime():HH:mm:ss}] [服务器预警] " +
+                $"{payload.System} ({payload.Jumps}跳) | {payload.Channel}/{payload.Author}: {payload.Text}";
+            richTextBoxAlertLog.AppendText(entry + Environment.NewLine);
+            richTextBoxAlertLog.ScrollToCaret();
+
+            _alertSoundPlayer?.Play(
+                _config.IntelSoundPath,
+                _config.IntelAlertVolume / 100f,
+                GetAlertLoopDuration());
         }
 
         /// <summary>

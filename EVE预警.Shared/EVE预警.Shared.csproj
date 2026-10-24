@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>EVE预警</RootNamespace>
+    <AssemblyName>EVE预警.Shared</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Data\map-data.json">
+      <LogicalName>EVE预警.Data.map-data.json</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>
